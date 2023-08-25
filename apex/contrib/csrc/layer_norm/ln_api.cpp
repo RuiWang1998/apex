@@ -156,23 +156,21 @@ std::vector<at::Tensor> ln_fwd(const at::Tensor &x,      // BxSxhidden_size
 
 std::vector<at::Tensor> ln_bwd(const at::Tensor &dz,     // BxSxhidden_size
                                const at::Tensor &x,      // BxSxhidden_size
-                               const at::Tensor &mu,     // BxS, FP32!
                                const at::Tensor &rsigma, // BxS, FP32!
-                               const at::Tensor &gamma   // hidden_size
+                               const at::Tensor &gamma,  // hidden_size
+                               const at::Tensor &beta    // hidden_size
 ) {
 
-    auto itype = x.scalar_type();
+    auto otype = x.scalar_type();
     auto wtype = gamma.scalar_type();
-    auto otype = wtype;
+    auto itype = wtype;
     auto ctype = torch::kFloat32;
 
     TORCH_CHECK(dz.dtype() == otype);
-    TORCH_CHECK(mu.dtype() == ctype);
     TORCH_CHECK(rsigma.dtype() == ctype);
 
     TORCH_CHECK(x.is_cuda());
     TORCH_CHECK(dz.is_cuda());
-    TORCH_CHECK(mu.is_cuda());
     TORCH_CHECK(rsigma.is_cuda());
     TORCH_CHECK(gamma.is_cuda());
 
@@ -186,9 +184,6 @@ std::vector<at::Tensor> ln_bwd(const at::Tensor &dz,     // BxSxhidden_size
     auto cols = sizes[1];
 
     auto hidden_size = gamma.numel();
-
-    TORCH_CHECK(mu.numel() == rows);
-    TORCH_CHECK(mu.sizes() == rsigma.sizes());
 
     TORCH_CHECK(gamma.numel() == cols);
 
@@ -214,9 +209,9 @@ std::vector<at::Tensor> ln_bwd(const at::Tensor &dz,     // BxSxhidden_size
     params.rows = rows;
     params.cols = cols;
     params.x = x.data_ptr();
-    params.mu = mu.data_ptr();
     params.rs = rsigma.data_ptr();
     params.gamma = gamma.data_ptr();
+    params.beta = beta.data_ptr();
     params.dz = dz.data_ptr();
     params.dx = dx.data_ptr();
     params.dbeta = dbeta.data_ptr();
