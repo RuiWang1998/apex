@@ -31,12 +31,52 @@ struct ParamsBase {
         : ctas_per_col(0)
         , rows(0)
         , cols(0)
+        , z(nullptr)
+        , mu(nullptr)
+        , rs(nullptr)
+        , gamma(nullptr)
+        , workspace(nullptr)
+        , barrier(nullptr)
+    {
+    }
+
+    // For Multi-CTA, number of different CTA groups. Otherwise same as gridDim.x.
+    int ctas_per_col;
+
+    // Input is interpreted as matrix. We normalize across columns.
+    int rows;
+    int cols;
+
+    // Common data pointers.
+    void *z;
+    void *mu;
+    void *rs;
+    void *gamma;
+
+    // Multi-CTA workspace in gmem.
+    void *workspace;
+
+    // Multi-CTA sync barriers in gmem.
+    int *barrier;
+
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FwdParams  {
+    FwdParams()
+        : ctas_per_col(0)
+        , rows(0)
+        , cols(0)
         , x(nullptr)
         , mu(nullptr)
         , rs(nullptr)
         , gamma(nullptr)
         , workspace(nullptr)
         , barrier(nullptr)
+        , z(nullptr)
+        , beta(nullptr)
+        , epsilon(0.f)
     {
     }
 
@@ -59,19 +99,6 @@ struct ParamsBase {
     // Multi-CTA sync barriers in gmem.
     int *barrier;
 
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct FwdParams : public ParamsBase {
-    FwdParams()
-        : ParamsBase()
-        , z(nullptr)
-        , beta(nullptr)
-        , epsilon(0.f)
-    {
-    }
-
     // Output of LN FWD.
     void *z;
     void *beta;
@@ -81,9 +108,17 @@ struct FwdParams : public ParamsBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct BwdParams : public ParamsBase {
+struct BwdParams {
     BwdParams()
-        : ParamsBase()
+        : ctas_per_col(0)
+        , rows(0)
+        , cols(0)
+        , x(nullptr)
+        , rs(nullptr)
+        , gamma(nullptr)
+        , beta(nullptr)
+        , workspace(nullptr)
+        , barrier(nullptr)
         , dz(nullptr)
         , dbeta_part(nullptr)
         , dgamma_part(nullptr)
@@ -92,6 +127,25 @@ struct BwdParams : public ParamsBase {
         , dgamma(nullptr)
     {
     }
+
+    // For Multi-CTA, number of different CTA groups. Otherwise same as gridDim.x.
+    int ctas_per_col;
+
+    // Input is interpreted as matrix. We normalize across columns.
+    int rows;
+    int cols;
+
+    // Common data pointers.
+    void *x;
+    void *rs;
+    void *gamma;
+    void *beta;
+
+    // Multi-CTA workspace in gmem.
+    void *workspace;
+
+    // Multi-CTA sync barriers in gmem.
+    int *barrier;
 
     // Input: gradient wrt. LN FWD output.
     void *dz;
