@@ -6,7 +6,17 @@ import inspect
 import io
 import itertools
 import threading
-from typing import Any, Callable, Iterable, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 import warnings
 
 import torch
@@ -170,18 +180,28 @@ def _multi_tensor_copy(
             # Just copy bytes if dtypes are same
             buf_in = buf_in.view(torch.uint8)
             buf_out = buf_out.view(torch.uint8)
-        key = (buf_in.is_cuda, buf_in.dtype, buf_out.is_cuda, buf_out.dtype)
+        is_cuda = (
+            _devices_match(buf_in.device, "cuda")
+            and _devices_match(buf_out.device, "cuda")
+        )
+        is_contiguous = buf_in.is_contiguous() and buf_out.is_contiguous()
+        key = (
+            buf_in.dtype,
+            buf_out.dtype,
+            is_cuda,
+            is_contiguous,
+        )
         buffer_groups[key].append((buf_in, buf_out))
 
     # Copy each group of buffers
     for key, buffers in buffer_groups.items():
         # Check if buffers support fused kernel
-        is_cuda_in, dtype_in, is_cuda_out, dtype_out = key
+        dtype_in, dtype_out, is_cuda, is_contiguous = key
         supported_dtypes = (torch.float32, torch.float16)
         use_fused_kernel = (
             dtype_in in supported_dtypes and dtype_out in supported_dtypes
         ) or (dtype_in == torch.uint8 and dtype_out == torch.uint8)
-        use_fused_kernel = use_fused_kernel and is_cuda_in and is_cuda_out
+        use_fused_kernel = use_fused_kernel and is_cuda and is_contiguous
 
         # Copy buffers
         if use_fused_kernel and _FOUND_DEPRECATED_FUSED_ADAM:
@@ -315,19 +335,19 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         pipeline_size (int, optional): number of buckets to process
             simultaneously in optimizer step (default: 2)
         contiguous_param_buffer (bool, optional): convert parameters
-            into views into a large persistent buffer (default:
-            False). This enables some performance optimizations (e.g.
-            avoiding some memory copies), but may add memory overhead
-            (e.g. if the memory allocator can't reuse the original
-            parameter buffers).
+            into views into large persistent buffers (default: False).
+            This enables some performance optimizations (e.g. avoiding
+            some memory copies), but may add memory overhead (e.g. if
+            the memory allocator can't reuse the original parameter
+            buffers).
         contiguous_grad_buffer (bool, optional): allocate gradient
-            buckets out of a large persistent buffer (default: False).
-            This allows individual parameter gradients to be accessed
-            externally (see grad_buffer_view function). It enables
-            some performance optimizations (e.g. avoiding some memory
-            copies), but prevents some memory optimizations (e.g. the
-            memory allocator can't reuse buffers for gradient
-            buckets).
+            buckets out of a large persistent buffers (default:
+            False). This allows individual parameter gradients to be
+            accessed externally (see grad_buffer_view function). It
+            enables some performance optimizations (e.g. avoiding some
+            memory copies), but prevents some memory optimizations
+            (e.g. the memory allocator can't reuse buffers for
+            gradient buckets).
         store_params (bool, optional): store a distributed copy of the
             parameters as optimizer state (default: True). This may be
             desirable if the optimizer dtype has higher precision than
@@ -383,6 +403,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             shard_size: int,
             dtype: torch.dtype,
             device: torch.device,
+            grad_sync_dtype: torch.dtype,
+            param_sync_dtype: torch.dtype,
             contiguous_buffer_offset: int = 0,
             store_params: bool = False,
             store_param_remainders: bool = False,
@@ -391,8 +413,16 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             self.bucket_size: int = bucket_size
             # Size of local shard of parameter bucket
             self.shard_size: int = shard_size
+            # Data type for state
+            self.dtype = dtype
+            # Data type for gradient synchronization
+            self.grad_sync_dtype = grad_sync_dtype
+            # Data type for parameter synchronization
+            self.param_sync_dtype = param_sync_dtype
             # Size of the filled region in the bucket
             self.filled_size: int = 0
+            # Is it able to continue filling
+            self.able_to_fill: bool = True
             # Offset to bucket in contiguous buffers
             self.contiguous_buffer_offset: int = contiguous_buffer_offset
             # Buffer ranges corresponding to parameter fragments
@@ -402,7 +432,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             if store_params:
                 self.params_shard = torch.zeros(
                     [shard_size],
-                    dtype=dtype,
+                    dtype=self.dtype,
                     device=device,
                 )
             # Local shard of parameter remainders
@@ -416,14 +446,22 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             # Local shard of first moment estimate
             self.exp_avg_shard: torch.Tensor = torch.zeros(
                 [shard_size],
-                dtype=dtype,
+                dtype=self.dtype,
                 device=device,
             )
             # Local shard of second moment estimate
             self.exp_avg_sq_shard: torch.Tensor = torch.zeros(
                 [shard_size],
-                dtype=dtype,
+                dtype=self.dtype,
                 device=device,
+            )
+
+        def dtypes(self) -> Tuple[torch.dtype, torch.dtype, torch.dtype]:
+            """Datatypes for the bucket's compute and communication"""
+            return (
+                self.dtype,
+                self.grad_sync_dtype,
+                self.param_sync_dtype,
             )
 
     class GradientStatus(enum.Enum):
@@ -532,9 +570,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         if (
             dtype not in supported_dtypes
             or grad_sync_dtype not in supported_dtypes
-            or param_sync_dtype not in supported_dtypes
         ):
-            raise RuntimeError(
+            raise ValueError(
                 "Unsupported dtypes for DistributedFusedAdam "
                 f"(dtype={dtype}, "
                 f"grad_sync_dtype={grad_sync_dtype}, "
@@ -635,14 +672,18 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Param state
         self._params_buckets: Dict[int, ParameterBucket] = collections.OrderedDict()
 
-        # Whether to allocate contiguous buffer for parameters
+        # Whether to allocate contiguous buffers for parameters
         self.contiguous_param_buffer: bool = contiguous_param_buffer
-        # Whether to allocate contiguous buffer for gradients
+        # Whether to allocate contiguous buffers for gradients
         self.contiguous_grad_buffer: bool = contiguous_grad_buffer
-        # Contiguous buffer for parameters
-        self._param_buffer: Optional[torch.Tensor] = None
-        # Contiguous buffer for gradients
-        self._grad_buffer: Optional[torch.Tensor] = None
+        # Contiguous buffers for parameters
+        self._param_buffers: Dict[
+            Tuple[torch.dtype, torch.dtype, torch.dtype], torch.Tensor
+        ] = {}
+        # Contiguous buffers for gradients
+        self._grad_buffers: Dict[
+            Tuple[torch.dtype, torch.dtype, torch.dtype], torch.Tensor
+        ] = {}
 
         # Side streams for optimizer step and communication
         self._pipeline_streams: List[torch.cuda.Stream] = [
@@ -910,11 +951,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     param_id,
                 )
 
+    @torch.no_grad()
     def init_param_buffer(self) -> None:
-        """Allocate contiguous buffer for param buckets
+        """Allocate contiguous buffers for param buckets
 
-        This converts the parameters into views into the contiguous
-        buffer. This enables some performance optimizations (e.g.
+        This converts the parameters into views into contiguous
+        buffers. This enables some performance optimizations (e.g.
         avoiding some memory copies), but may add memory overhead
         (e.g. if the memory allocator can't reuse the original
         parameter buffers). To minimize memory overhead, this buffer
@@ -926,19 +968,21 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self.contiguous_param_buffer = True
         self.init_params()
 
-        # Construct param buffer
-        if self.state["buckets"]:
-            buffer_size = max(
-                bucket.contiguous_buffer_offset + bucket.bucket_size
-                for bucket in self.state["buckets"]
+        # Construct param buffers
+        buffer_sizes = collections.defaultdict(lambda: 0)
+        for bucket in self.state["buckets"]:
+            dtypes = bucket.dtypes()
+            buffer_sizes[dtypes] = max(
+                bucket.contiguous_buffer_offset + bucket.bucket_size,
+                buffer_sizes[dtypes],
             )
-        else:
-            buffer_size = 0
-        self._param_buffer = torch.zeros(
-            [buffer_size],
-            dtype=self.param_sync_dtype,
-            device=self.device,
-        )
+        for dtypes, buffer_size in buffer_sizes.items():
+            _, _, param_sync_dtype = dtypes
+            self._param_buffers[dtypes] = torch.zeros(
+                [buffer_size],
+                dtype=param_sync_dtype,
+                device=self.device,
+            )
 
         # Figure out corresponding positions in params and param buffer
         params = list(self.parameters())
@@ -947,24 +991,26 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         for i, param in enumerate(params):
             fragment = self.state[param]["fragments"][0]
             bucket_id = fragment.bucket_id
+            bucket = self.state["buckets"][bucket_id]
             param_size = param.numel()
             bucket_start, _ = fragment.bucket_range
-            buffer_offset = self.state["buckets"][bucket_id].contiguous_buffer_offset
+            buffer_offset = bucket.contiguous_buffer_offset
             buffer_start = buffer_offset + bucket_start
             buffer_end = buffer_start + param_size
-            buffer_view = self._param_buffer[buffer_start:buffer_end].detach()
-            if not _devices_match(buffer_view.device, param.device):
+            param_buffer = self._param_buffers[bucket.dtypes()]
+            param_buffer_view = param_buffer[buffer_start:buffer_end].detach()
+            if not _devices_match(param_buffer_view.device, param.device):
                 raise RuntimeError(
                     "Attempted to change a parameter with device={param.device} "
-                    f"into a buffer view with device={view_buffer.device}"
+                    f"into a buffer view with device={param_buffer_view.device}"
                 )
-            if buffer_view.dtype != param.dtype:
+            if param_buffer_view.dtype != param.dtype:
                 raise RuntimeError(
                     f"Attempted to change a parameter with dtype={param.dtype} "
-                    f"into a buffer view with dtype={view_buffer.dtype}"
+                    f"into a buffer view with dtype={param_view_buffer.dtype}"
                 )
             param_flat_views.append(param.detach().view(-1))
-            param_buffer_views.append(buffer_view)
+            param_buffer_views.append(param_buffer_view)
 
         # Copy values into param buffer
         _multi_tensor_copy(
@@ -979,20 +1025,26 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
     def _init_grad_buffer(self) -> None:
         """Allocate contiguous buffer for grad buckets"""
+
+        # Make sure all params are initialized
         self.contiguous_grad_buffer = True
-        self.init_params()  # Make sure all params are initialized
-        if self.state["buckets"]:
-            buffer_size = max(
-                bucket.contiguous_buffer_offset + bucket.bucket_size
-                for bucket in self.state["buckets"]
+        self.init_params()
+
+        # Construct grad buffers
+        buffer_sizes = collections.defaultdict(lambda: 0)
+        for bucket in self.state["buckets"]:
+            dtypes = bucket.dtypes()
+            buffer_sizes[dtypes] = max(
+                bucket.contiguous_buffer_offset + bucket.bucket_size,
+                buffer_sizes[dtypes],
             )
-        else:
-            buffer_size = 0
-        self._grad_buffer = torch.zeros(
-            [buffer_size],
-            dtype=self.grad_sync_dtype,
-            device=self.device,
-        )
+        for dtypes, buffer_size in buffer_sizes.items():
+            _, grad_sync_dtype, _ = dtypes
+            self._grad_buffers[dtypes] = torch.zeros(
+                [buffer_size],
+                dtype=grad_sync_dtype,
+                device=self.device,
+            )
 
     def parameters(self) -> Iterable[torch.nn.Parameter]:
         """Returns an iterator over optimizer parameters"""
@@ -1000,9 +1052,45 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             group["params"] for group in self.param_groups
         )
 
+    def parameter(
+        self,
+        *args: Union[int, ParameterFragment],
+    ) -> torch.nn.Parameter:
+        """Get optimizer parameter
+
+        Can either accept two ints or one
+        DistributedFusedAdam.ParameterFragment.
+
+        Arguments:
+            param_group_id (int): Parameter group index
+            param_id (int): Parameter index within parameter group
+
+        """
+        if (
+            len(args) == 2
+            and isinstance(args[0], int)
+            and isinstance(args[1], int)
+        ):
+            param_group_id = args[0]
+            param_id = args[1]
+        elif len(args) == 1 and isinstance(args[0], self.ParameterFragment):
+            fragment = args[0]
+            param_group_id = fragment.param_group_id
+            param_id = fragment.param_id
+        else:
+            raise TypeError(
+                "Expected input types are "
+                "[int, int] or [DistributedFusedAdam.ParameterFragment], "
+                f"but found {[type(arg).__name__ for arg in args]}"
+            )
+        return self.param_groups[param_group_id]["params"][param_id]
+
     def init_params(
         self,
         params: Optional[Iterable[torch.nn.Parameter]] = None,
+        dtype: Optional[torch.dtype] = None,
+        grad_sync_dtype: Optional[torch.dtype] = None,
+        param_sync_dtype: Optional[torch.dtype] = None,
     ) -> None:
         """Initialize optimizer state for parameters
 
@@ -1035,9 +1123,37 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         for param in params:
             if param in id_map:
                 param_group_id, param_id = id_map[param]
-                self._init_param_state(param, param_group_id, param_id)
+                self._init_param_state(
+                    param,
+                    param_group_id,
+                    param_id,
+                    dtype=dtype,
+                    grad_sync_dtype=grad_sync_dtype,
+                    param_sync_dtype=param_sync_dtype,
+                )
 
-    def init_params_bucket(self, params: Iterable[torch.nn.Parameter]) -> None:
+        # Check if buckets are underutilized
+        num_params = sum(1 for param in self.parameters())
+        num_initialized_params = sum(
+            1 for param in self.parameters() if "fragments" in self.state[param]
+        )
+        if num_initialized_params == num_params:
+            bucket_size = sum(bucket.bucket_size for bucket in self.state["buckets"])
+            filled_size = sum(bucket.filled_size for bucket in self.state["buckets"])
+            buckets_utilization = filled_size / bucket_size
+            if buckets_utilization < 0.7:
+                warnings.warn(
+                    f"Only {buckets_utilization:.1%} of buckets are used. "
+                    "Consider decreasing the bucket_cap_mb argument."
+                )
+
+    def init_params_bucket(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        dtype: Optional[torch.dtype] = None,
+        grad_sync_dtype: Optional[torch.dtype] = None,
+        param_sync_dtype: Optional[torch.dtype] = None,
+    ) -> None:
         """Initialize optimizer state for parameters in one effective bucket
 
         The buckets corresponding to the provided parameters are
@@ -1065,18 +1181,23 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         # Mark existings bucket as fully filled
         for bucket in self.state["buckets"]:
-            bucket.filled_size = bucket.bucket_size
+            bucket.able_to_fill = False
 
         # Initialize optimizer state for parameters
         start_bucket_id = len(self.state["buckets"])
-        self.init_params(params)
+        self.init_params(
+            params,
+            dtype=dtype,
+            grad_sync_dtype=grad_sync_dtype,
+            param_sync_dtype=param_sync_dtype,
+        )
         end_bucket_id = len(self.state["buckets"])
 
         # Make sure all added buckets depend on provided params
         for bucket_id in range(start_bucket_id, end_bucket_id):
             bucket = self.state["buckets"][bucket_id]
             bucket_size = bucket.bucket_size
-            bucket.filled_size = bucket_size
+            bucket.able_to_fill = False
             ids_in_bucket = set(
                 (fragment.param_group_id, fragment.param_id)
                 for fragment in bucket.fragments
@@ -1103,6 +1224,9 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         param: torch.nn.Parameter,
         param_group_id: int,
         param_id: int,
+        dtype: Optional[torch.dtype] = None,
+        grad_sync_dtype: Optional[torch.dtype] = None,
+        param_sync_dtype: Optional[torch.dtype] = None,
     ) -> None:
         """Initialize optimizer state for a parameter"""
 
@@ -1111,22 +1235,82 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             return
         self.state[param]["fragments"] = []
 
-        # Make sure there is at least one bucket
-        if not self.state["buckets"]:
-            shard_size = self.default_shard_size
-            bucket_size = shard_size * self.distributed_size
-            buffer_offset = 0
+        # Data type configuration
+        if dtype is None:
+            dtype = self.dtype
+        if grad_sync_dtype is None:
+            grad_sync_dtype = self.grad_sync_dtype
+        if param_sync_dtype is None:
+            param_sync_dtype = self.param_sync_dtype
+        if dtype != self.dtype:
+            raise ValueError(
+                "Optimizer states with non-default dtypes are not supported"
+            )
+        supported_dtypes = (torch.float32, torch.float16, torch.bfloat16)
+        if (
+            dtype not in supported_dtypes
+            or grad_sync_dtype not in supported_dtypes
+        ):
+            raise ValueError(
+                "Unsupported dtypes for DistributedFusedAdam "
+                f"(dtype={dtype}, "
+                f"grad_sync_dtype={grad_sync_dtype}, "
+                f"param_sync_dtype={param_sync_dtype}))"
+            )
+
+        # Store params or param remainders
+        store_params = (
+            self.store_params
+            or dtype != self.dtype
+            or param_sync_dtype != self.param_sync_dtype
+        )
+        store_param_remainders = (
+            self.store_param_remainders
+            and dtype == self.dtype
+            and param_sync_dtype == self.param_sync_dtype
+        )
+
+        def last_bucket_id() -> int:
+            """Index of last optimizer state bucket with desired dtypes
+
+            -1 if there are no such buckets.
+
+            """
+            dtypes = (dtype, grad_sync_dtype, param_sync_dtype)
+            bucket_id = len(self.state["buckets"]) - 1
+            while bucket_id > 0:
+                bucket = self.state["buckets"][bucket_id]
+                if bucket.dtypes() == dtypes:
+                    break
+                bucket_id -= 1
+            return bucket_id
+
+        def make_bucket(
+            bucket_size: int,
+            shard_size: int,
+            buffer_offset: int,
+        ) -> None:
+            """Construct new optimizer state bucket"""
             self.state["buckets"].append(
                 self.StateBucket(
                     bucket_size,
                     shard_size,
-                    self.dtype,
+                    dtype,
                     self.device,
+                    grad_sync_dtype,
+                    param_sync_dtype,
                     contiguous_buffer_offset=buffer_offset,
-                    store_params=self.store_params,
-                    store_param_remainders=self.store_param_remainders,
+                    store_params=store_params,
+                    store_param_remainders=store_param_remainders,
                 )
             )
+
+        # Make sure there is at least one bucket with expected dtypes
+        if last_bucket_id() < 0:
+            shard_size = self.default_shard_size
+            bucket_size = shard_size * self.distributed_size
+            buffer_offset = 0
+            make_bucket(bucket_size, shard_size, buffer_offset)
 
         # Split parameter values into fragments
         # Note: Each fragment resides within a bucket
@@ -1134,7 +1318,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         param_size = param.numel()
         while param_start < param_size:
             # Get current bucket
-            bucket_id = len(self.state["buckets"]) - 1
+            bucket_id = last_bucket_id()
             bucket = self.state["buckets"][bucket_id]
             fragment_id = len(bucket.fragments)
             bucket_size = bucket.bucket_size
@@ -1151,21 +1335,11 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             bucket_end = bucket_start + fragment_size
 
             # Create new bucket if current one is full
-            if fragment_size <= 0:
+            if fragment_size <= 0 or not bucket.able_to_fill:
                 shard_size = self.default_shard_size
                 bucket_size = shard_size * self.distributed_size
                 buffer_offset = bucket.contiguous_buffer_offset + bucket.bucket_size
-                self.state["buckets"].append(
-                    self.StateBucket(
-                        bucket_size,
-                        shard_size,
-                        self.dtype,
-                        self.device,
-                        contiguous_buffer_offset=buffer_offset,
-                        store_params=self.store_params,
-                        store_param_remainders=self.store_param_remainders,
-                    )
-                )
+                make_bucket(bucket_size, shard_size, buffer_offset)
                 continue
 
             # Fragment position within local shard
@@ -1205,7 +1379,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             param_start = param_end
 
         # Initialize main param buffer
-        if self.store_params:
+        if store_params:
             for fragment in self.state[param]["fragments"]:
                 if fragment.in_local_shard:
                     bucket = self.state["buckets"][fragment.bucket_id]
@@ -1225,28 +1399,34 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         # Construct views into contiguous grad buffer, if needed
         if self.contiguous_grad_buffer:
-            if self._grad_buffer is None:
+            if not self._grad_buffers:
                 self._init_grad_buffer()
-            self._grad_buffer.zero_()
+            for grad_buffer in self._grad_buffers.values():
+                grad_buffer.zero_()
             for bucket_id, bucket in enumerate(self.state["buckets"]):
                 bucket_size = bucket.bucket_size
                 buffer_start = bucket.contiguous_buffer_offset
                 buffer_end = buffer_start + bucket_size
-                grad_buffer = self._grad_buffer[buffer_start:buffer_end]
-                self._grads_buckets[bucket_id].grads_bucket = grad_buffer
+                grad_buffer = self._grad_buffers[bucket.dtypes()]
+                self._grads_buckets[bucket_id].grads_bucket = grad_buffer[
+                    buffer_start:buffer_end
+                ]
 
         # Reset param grads
         for param in self.parameters():
             with _disable_pre_forward_hook(param):
+                need_to_zero = True
                 if set_to_none:
                     param.grad = None
-                elif (
-                    self.contiguous_grad_buffer
-                    and param.dtype == self.grad_sync_dtype
-                    and _devices_match(param.device, self.device)
-                ):
-                    param.grad = self.grad_buffer_view(param)
-                elif param.grad is not None:
+                elif self.contiguous_grad_buffer:
+                    bucket_id = self.state[param]["fragments"][0].bucket_id
+                    bucket = self.state["buckets"][bucket_id]
+                    if param.dtype == bucket.grad_sync_dtype and _devices_match(
+                        param.device, self.device
+                    ):
+                        param.grad = self.grad_buffer_view(param)
+                        need_to_zero = False
+                if need_to_zero and param.grad is not None:
                     param.grad.zero_()
 
         # Reset other state
@@ -1257,7 +1437,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         )
 
     def _grad_copy(self, param: torch.nn.Parameter) -> None:
-        """Copy parameter gradients to buckets"""
+        """Copy parameter gradients to gradient buckets
+
+        Initializes gradient buckets if needed. The original parameter
+        gradient is set to None.
+
+        """
 
         # Initialize parameter if needed
         if "fragments" not in self.state[param]:
@@ -1276,6 +1461,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             bucket_id = fragment.bucket_id
             bucket = self._grads_buckets[bucket_id]
             bucket_size = self.state["buckets"][bucket_id].bucket_size
+            grad_sync_dtype = self.state["buckets"][bucket_id].grad_sync_dtype
             grad_start, grad_end = fragment.param_range
             bucket_start, bucket_end = fragment.bucket_range
 
@@ -1286,21 +1472,24 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
             # Allocate gradient buffer if needed
             if bucket.grads_bucket is None and self.contiguous_grad_buffer:
-                if self._grad_buffer is None:
+                if not self._grad_buffers:
                     self._init_grad_buffer()
-                buffer_start = self.state["buckets"][bucket_id].contiguous_buffer_offset
+                state_bucket = self.state["buckets"][bucket_id]
+                buffer_start = state_bucket.contiguous_buffer_offset
                 buffer_end = buffer_start + bucket_size
-                grad_buffer = self._grad_buffer[buffer_start:buffer_end]
+                grad_buffer = self._grad_buffers[state_bucket.dtypes()]
+                grad_buffer = grad_buffer[buffer_start:buffer_end]
                 if (
                     bucket.grads_shard is None
-                    or bucket.grads_shard.data_ptr() != grad_buffer.data_ptr()
+                    or bucket.grads_shard.storage().data_ptr()
+                    != grad_buffer.storage().data_ptr()
                 ):
                     bucket.grads_bucket = grad_buffer
                     bucket.grads_bucket.zero_()
             if bucket.grads_bucket is None:
                 bucket.grads_bucket = torch.zeros(
                     [bucket_size],
-                    dtype=self.grad_sync_dtype,
+                    dtype=grad_sync_dtype,
                     device=self.device,
                 )
 
@@ -1314,8 +1503,15 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Free param grad buffer
         param.grad = None
 
-    def _param_copy(self, params: torch.nn.Parameter) -> None:
-        """Update parameters with values from parameter buckets"""
+    def _param_copy(
+        self,
+        params: Union[torch.nn.Parameter, Iterable[torch.nn.Parameter]],
+    ) -> None:
+        """Update parameters with values from parameter buckets
+
+        Synchronizes and deletes parameter buckets as needed.
+
+        """
 
         # Get parameter fragments to be synchronized
         if isinstance(params, torch.Tensor):
@@ -1328,6 +1524,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     for fragment in self.state[param]["fragments"]
                     if fragment.bucket_id in self._params_buckets
                 )
+
+        # Return immediately if no fragments need to be synchronized
+        if not fragments:
+            return
 
         # Make sure all needed buckets have been synchronized
         buckets = collections.OrderedDict()
@@ -1342,36 +1542,66 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             self._finish_bucket_param_sync()
 
         # Copy values from bucket buffers to params
-        params_in = []
-        params_out = []
-        for fragment in fragments:
-            bucket_id = fragment.bucket_id
-            param_group_id = fragment.param_group_id
-            param_id = fragment.param_id
-            bucket_start, bucket_end = fragment.bucket_range
-            param_start, param_end = fragment.param_range
-            if param_end > param_start:
-                bucket = self._params_buckets[bucket_id]
-                param = self.param_groups[param_group_id]["params"][param_id]
-                params_in.append(bucket.params_bucket[bucket_start:bucket_end])
-                params_out.append(param.detach().view(-1)[param_start:param_end])
-        _multi_tensor_copy(
-            params_in,
-            params_out,
-            dummy_overflow_buf=self._dummy_overflow_buf,
-        )
+        self._param_copy_fragments(fragments)
 
         # Delete buckets if possible
         for fragment in fragments:
             bucket_id = fragment.bucket_id
             bucket = self._params_buckets[bucket_id]
+            bucket.params_updated.add(self.parameter(fragment))
             bucket_fragments = self.state["buckets"][bucket_id].fragments
-            param_group_id = fragment.param_group_id
-            param_id = fragment.param_id
-            param = self.param_groups[param_group_id]["params"][param_id]
-            bucket.params_updated.add(param)
             if len(bucket.params_updated) == len(bucket_fragments):
                 del self._params_buckets[bucket_id]
+
+    def _param_copy_fragments(
+        self,
+        fragments: Iterable[ParameterFragment],
+    ) -> None:
+        """Update parameter fragments with values from parameter buckets"""
+
+        # Figure out corresponding positions in param buckets and params
+        buffers_in = []
+        buffers_out = []
+        for fragment in fragments:
+
+            # Check if fragment needs to be updated
+            bucket_id = fragment.bucket_id
+            bucket_start, bucket_end = fragment.bucket_range
+            param_start, param_end = fragment.param_range
+            if param_end <= param_start or bucket_id not in self._params_buckets:
+                continue
+
+            # Corresponding positions in param bucket and param
+            bucket = self._params_buckets[bucket_id]
+            param = self.parameter(fragment)
+            buffer_in = bucket.params_bucket[bucket_start:bucket_end]
+            buffer_out = param.detach().view(-1)[param_start:param_end]
+
+            if (
+                torch.is_floating_point(buffer_in)
+                and torch.is_floating_point(buffer_out)
+            ):
+                # Cast between floating-point dtypes
+                buffers_in.append(buffer_in)
+                buffers_out.append(buffer_out)
+            else:
+                # Copy most significant bytes for non-floating-point
+                # dtypes
+                # Note: Assume dtypes are little-endian
+                in_bytes = buffer_in.unsqueeze(-1).view(torch.uint8)
+                out_bytes = buffer_out.unsqueeze(-1).view(torch.uint8)
+                copy_size = min(in_bytes.size(-1), out_bytes.size(-1))
+                buffers_in.append(in_bytes[..., -copy_size:])
+                buffers_out.append(out_bytes[..., -copy_size:])
+                if copy_size < out_bytes.size(-1):
+                    out_bytes[..., :-copy_size].zero_()
+
+        # Copy data from parameter buckets to parameters
+        _multi_tensor_copy(
+            buffers_in,
+            buffers_out,
+            dummy_overflow_buf=self._dummy_overflow_buf,
+        )
 
     def grad_buffer_view(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Construct view into grad buffer corresponding to param
@@ -1380,22 +1610,23 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         """
 
-        # Initialize contiguous grad buffer if needed
+        # Initialize contiguous grad buffers if needed
         assert self.contiguous_grad_buffer
-        if self._grad_buffer is None:
+        if not self._grad_buffers:
             self._init_grad_buffer()
 
         # Figure out corresponding position in grad buffer
         fragment = self.state[param]["fragments"][0]
         bucket_id = fragment.bucket_id
-        param_size = param.numel()
+        bucket = self.state["buckets"][bucket_id]
         bucket_start, _ = fragment.bucket_range
-        buffer_offset = self.state["buckets"][bucket_id].contiguous_buffer_offset
+        buffer_offset = bucket.contiguous_buffer_offset
         buffer_start = buffer_offset + bucket_start
-        buffer_end = buffer_start + param_size
+        buffer_end = buffer_start + param.numel()
 
         # Construct view into grad buffer
-        flat_buffer = self._grad_buffer[buffer_start:buffer_end]
+        flat_buffer = self._grad_buffers[bucket.dtypes()]
+        flat_buffer = flat_buffer[buffer_start:buffer_end]
         return flat_buffer.detach().view(param.size())
 
     def _force_bucket_grad_sync(self) -> None:
@@ -1404,14 +1635,14 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Synchronize all unsynchronized buckets
         Status = self.GradientStatus
         buckets = []
-        for bucket_id, bucket in sorted(self._grads_buckets.items()):
-            if bucket.status not in (Status.READY, Status.SYNCING):
-                buckets.append(bucket)
-                if bucket.grads_bucket is None:
-                    bucket_size = self.state["buckets"][bucket_id].bucket_size
-                    bucket.grads_bucket = torch.zeros(
-                        [bucket_size],
-                        dtype=self.grad_sync_dtype,
+        for bucket_id, grads_bucket in sorted(self._grads_buckets.items()):
+            if grads_bucket.status not in (Status.READY, Status.SYNCING):
+                buckets.append(grads_bucket)
+                if grads_bucket.grads_bucket is None:
+                    state_bucket = self.state["buckets"][bucket_id]
+                    grads_bucket.grads_bucket = torch.zeros(
+                        [state_bucket.bucket_size],
+                        dtype=state_bucket.grad_sync_dtype,
                         device=self.device,
                     )
         if buckets:
@@ -1420,12 +1651,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         # Fill any unsynchronized gradients with zeros
         for bucket_id in range(len(self.state["buckets"])):
-            bucket = self._grads_buckets[bucket_id]
-            if bucket.grads_shard is None:
-                shard_size = self.state["buckets"][bucket_id].shard_size
-                bucket.grads_shard = torch.zeros(
-                    [shard_size],
-                    dtype=self.grad_sync_dtype,
+            grads_bucket = self._grads_buckets[bucket_id]
+            if grads_bucket.grads_shard is None:
+                state_bucket = self.state["buckets"][bucket_id]
+                grads_bucket.grads_shard = torch.zeros(
+                    [state_bucket.shard_size],
+                    dtype=state_bucket.grad_sync_dtype,
                     device=self.device,
                 )
 
@@ -1456,16 +1687,16 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         for param in params:
             for fragment in self.state[param]["fragments"]:
                 bucket_id = fragment.bucket_id
-                bucket = self._grads_buckets[bucket_id]
-                bucket_fragments = self.state["buckets"][bucket_id].fragments
-                bucket.grads_generated.add(param)
-                if len(bucket.grads_generated) == len(bucket_fragments):
-                    bucket.status = self.GradientStatus.FULLY_FILLED
-                    if bucket.grads_bucket is None:
-                        bucket_size = self.state["buckets"][bucket_id].bucket_size
-                        bucket.grads_bucket = torch.zeros(
-                            [bucket_size],
-                            dtype=self.grad_sync_dtype,
+                grads_bucket = self._grads_buckets[bucket_id]
+                state_bucket = self.state["buckets"][bucket_id]
+                bucket_fragments = state_bucket.fragments
+                grads_bucket.grads_generated.add(param)
+                if len(grads_bucket.grads_generated) == len(bucket_fragments):
+                    grads_bucket.status = self.GradientStatus.FULLY_FILLED
+                    if grads_bucket.grads_bucket is None:
+                        grads_bucket.grads_bucket = torch.zeros(
+                            [state_bucket.bucket_size],
+                            dtype=state_bucket.grad_sync_dtype,
                             device=self.device,
                         )
 
@@ -1514,8 +1745,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 shard_size = bucket_size // self.distributed_size
                 bucket.sync_grads_shard = torch.empty(
                     [shard_size],
-                    dtype=self.grad_sync_dtype,
-                    device=self.device,
+                    dtype=bucket.grads_bucket.dtype,
+                    device=bucket.grads_bucket.device,
                 )
 
         # Side stream for communication
@@ -1607,11 +1838,11 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 return
             for bucket_id, bucket in self._params_buckets.items():
                 if bucket.status == self.ParameterStatus.SHARDED:
-                    fragment = self.state["buckets"][bucket_id].fragments[-1]
-                    param_group_id = fragment.param_group_id
-                    param_id = fragment.param_id
-                    param = self.param_groups[param_group_id]["params"][param_id]
-                    params.append(param)
+                    params.append(
+                        self.parameter(
+                            self.state["buckets"][bucket_id].fragments[-1]
+                        )
+                    )
                     break
 
         # Find buckets corresponding to params
@@ -1655,15 +1886,17 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         ]
         for bucket in buckets:
             bucket.status = self.ParameterStatus.SYNCING
-            if self.distributed_size == 1:
+            if bucket.params_bucket is not None:
+                pass
+            elif self.distributed_size == 1:
                 bucket.params_bucket = bucket.params_shard
-            elif bucket.params_bucket is None:
+            else:
                 shard_size = bucket.params_shard.numel()
                 bucket_size = shard_size * self.distributed_size
                 bucket.params_bucket = torch.empty(
                     [bucket_size],
-                    dtype=self.param_sync_dtype,
-                    device=self.device,
+                    dtype=bucket.params_shard.dtype,
+                    device=bucket.params_shard.device,
                 )
 
         # Side stream for communication
@@ -1732,9 +1965,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         """Ensure that all gradients are synchronized"""
         for bucket in self.state["buckets"]:
             for fragment in bucket.fragments:
-                param_group_id = fragment.param_group_id
-                param_id = fragment.param_id
-                param = self.param_groups[param_group_id]["params"][param_id]
+                param = self.parameter(fragment)
                 if param.grad is not None:
                     self._grad_copy(param)
                     if not self.contiguous_grad_buffer:
@@ -1752,12 +1983,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             while self._params_buckets:
                 bucket_id, bucket = next(iter((self._params_buckets.items())))
                 for fragment in reversed(self.state["buckets"][bucket_id].fragments):
-                    param_id = fragment.param_id
-                    param_group_id = fragment.param_group_id
-                    param = self.param_groups[param_group_id]["params"][param_id]
-                    self._param_copy(param)
+                    self._param_copy(self.parameter(fragment))
         self._params_buckets.clear()
 
+    @torch.no_grad()
     def _local_grad_norm(
         self,
         parameters: Optional[Iterable[torch.nn.Parameter]] = None,
@@ -1785,11 +2014,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             all_params_set = set()
             for bucket in self.state["buckets"]:
                 for fragment in bucket.fragments:
-                    param_group_id = fragment.param_group_id
-                    param_id = fragment.param_id
-                    all_params_set.add(
-                        self.param_groups[param_group_id]["params"][param_id]
-                    )
+                    all_params_set.add(self.parameter(fragment))
             if not params_set.issubset(all_params_set):
                 raise RuntimeError(
                     "Attempted to compute gradient norm for a parameter "
@@ -1798,43 +2023,52 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             if params_set == all_params_set:
                 parameters = None
 
+        # Group grads by dtype
+        grad_groups = collections.defaultdict(list)
         if parameters is None:
             # Compute norm of all local gradients
-            grad_norm_sq = (
-                multi_tensor_applier(
-                    amp_C.multi_tensor_l2norm,
-                    self._dummy_overflow_buf,
-                    [[bucket.grads_shard for bucket in self._grads_buckets.values()]],
-                    False,
-                )[0]
-                ** 2
-            )
+            for bucket_id, grads_bucket in self._grads_buckets.items():
+                state_bucket = self.state["buckets"][bucket_id]
+                dtype = state_bucket.grad_sync_dtype
+                grad_groups[dtype].append(grads_bucket.grads_shard)
         else:
             # Compute norm of selected local gradients
-            grads = []
             for param in parameters:
                 if "fragments" not in self.state[param]:
                     continue
                 for fragment in self.state[param]["fragments"]:
-                    if fragment.in_local_shard:
-                        bucket = self._grads_buckets[fragment.bucket_id]
-                        shard_start, shard_end = fragment.shard_range
-                        if shard_end > shard_start:
-                            grads.append(bucket.grads_shard[shard_start:shard_end])
-            if grads:
-                grad_norm_sq = (
-                    multi_tensor_applier(
-                        amp_C.multi_tensor_l2norm,
-                        self._dummy_overflow_buf,
-                        [grads],
-                        False,
-                    )[0]
-                    ** 2
-                )
-            else:
-                grad_norm_sq = torch.zeros([1], dtype=self.dtype, device=self.device)
+                    if not fragment.in_local_shard:
+                        continue
+                    shard_start, shard_end = fragment.shard_range
+                    if shard_end <= shard_start:
+                        continue
+                    bucket_id = fragment.bucket_id
+                    grads_bucket = self._grads_buckets[bucket_id]
+                    state_bucket = self.state["buckets"][bucket_id]
+                    grad_groups[state_bucket.grad_sync_dtype].append(
+                        grads_bucket.grads_shard[shard_start:shard_end]
+                    )
 
-        grad_norm_sq = grad_norm_sq.detach()
+        # Compute norm of each group of grads
+        grad_norm_sq = None
+        for grad_group in grad_groups.values():
+            grad_group_norm_sq = (
+                multi_tensor_applier(
+                    amp_C.multi_tensor_l2norm,
+                    self._dummy_overflow_buf,
+                    [grad_group],
+                    False,
+                )[0]
+                ** 2
+            )
+            if grad_norm_sq is None:
+                grad_norm_sq = grad_group_norm_sq
+            else:
+                grad_norm_sq += grad_group_norm_sq
+        if grad_norm_sq is None:
+            grad_norm_sq = torch.zeros([], dtype=self.dtype, device=self.device)
+
+        # Interpret norm as scalar
         grad_norm_sq = grad_norm_sq.to(dtype=self.dtype, device=self.device)
         grad_norm_sq = grad_norm_sq.view([])
         return grad_norm_sq
@@ -1967,45 +2201,63 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._grad_scale = self._grad_scale.to(dtype=torch.float32, device=self.device)
 
         # Initialize param shard buffers
-        for bucket_id in reversed(range(len(self.state["buckets"]))):
-            bucket = self.ParameterBucket()
-            self._params_buckets[bucket_id] = bucket
-            shard_size = self.state["buckets"][bucket_id].shard_size
-            if self.contiguous_param_buffer:
-                if self._param_buffer is None:
-                    self.init_param_buffer()
-                bucket_size = self.state["buckets"][bucket_id].bucket_size
-                buffer_start = self.state["buckets"][bucket_id].contiguous_buffer_offset
-                buffer_end = buffer_start + bucket_size
-                bucket.params_bucket = self._param_buffer[buffer_start:buffer_end]
-                bucket_start = self.distributed_rank * shard_size
-                bucket_end = bucket_start + shard_size
-                bucket.params_shard = bucket.params_bucket[bucket_start:bucket_end]
-            else:
-                bucket.params_shard = torch.empty(
-                    [shard_size],
-                    dtype=self.param_sync_dtype,
-                    device=self.device,
-                )
-
-        # Apply optimizer step and synchronize params
-        self.state["step"] += 1
-        if (
+        overlap_first_bucket = (
             self.distributed_size > 1
             and self.overlap_param_sync
             and self.state["buckets"]
-        ):
+        )
+        for bucket_id in reversed(range(len(self.state["buckets"]))):
+            params_bucket = self.ParameterBucket()
+            state_bucket = self.state["buckets"][bucket_id]
+            shard_size = state_bucket.shard_size
+            param_sync_dtype = state_bucket.param_sync_dtype
+            if self.contiguous_param_buffer:
+                # Construct view into contiguous param buffer
+                if not self._param_buffers:
+                    self.init_param_buffer()
+                bucket_size = state_bucket.bucket_size
+                buffer_start = state_bucket.contiguous_buffer_offset
+                buffer_end = buffer_start + bucket_size
+                param_buffer = self._param_buffers[state_bucket.dtypes()]
+                params_bucket.params_bucket = param_buffer[buffer_start:buffer_end]
+                bucket_start = self.distributed_rank * shard_size
+                bucket_end = bucket_start + shard_size
+                params_bucket.params_shard = params_bucket.params_bucket[
+                    bucket_start:bucket_end
+                ]
+            elif not param_sync_dtype.is_floating_point:
+                # Allocate temporary buffer for param shard
+                # Note: Adam kernel only supports floating-point
+                # dtypes.
+                params_bucket.params_shard = torch.empty(
+                    [shard_size],
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                overlap_first_bucket = False
+            else:
+                # Allocate param shard buffer
+                params_bucket.params_shard = torch.empty(
+                    [shard_size],
+                    dtype=param_sync_dtype,
+                    device=self.device,
+                )
+            self._params_buckets[bucket_id] = params_bucket
+
+        # Apply optimizer step
+        self.state["step"] += 1
+        if overlap_first_bucket:
             # Local step and non-blocking param sync
             # Note: Overlap param sync of first buckets with optimizer
             # step of remaining buckets.
 
             # Get buckets containing "first" parameter
-            fragment = self.state["buckets"][-1].fragments[-1]
-            param_group_id = fragment.param_group_id
-            param_id = fragment.param_id
-            param = self.param_groups[param_group_id]["params"][param_id]
+            first_param = self.parameter(
+                self.state["buckets"][-1].fragments[-1]
+            )
             first_bucket_ids = sorted(
-                fragment.bucket_id for fragment in self.state[param]["fragments"]
+                fragment.bucket_id
+                for fragment in self.state[first_param]["fragments"]
             )
 
             # Local step and launch param sync for first buckets
@@ -2022,13 +2274,19 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 if bucket_id not in first_bucket_ids
             )
 
-            # Enable pre-forward hook
+        else:
+            # Local step
+            self._local_step(list(range(len(self.state["buckets"]))))
+            self._check_params_shard_dtypes(self._params_buckets)
+
+        # Synchronize params
+        if self.distributed_size > 1 and self.overlap_param_sync:
+            # Asynchronous param sync
+            self._try_start_bucket_param_sync()
             for param in self.parameters():
                 param._pre_forward_hook_is_enabled = True
-
         else:
-            # Local step and blocking param sync
-            self._local_step(list(range(len(self.state["buckets"]))))
+            # Blocking param sync
             self.param_sync()
 
         return loss
@@ -2044,48 +2302,71 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Optimized implementation with BF16 params and 16-bit param
         # remainders
         if self.store_param_remainders:
-            self._local_step_with_param_remainders(bucket_ids)
-            return
+            bf16_rem_buckets = set()
+            for bucket_id in bucket_ids:
+                state_bucket = self.state["buckets"][bucket_id]
+                if state_bucket.param_remainders_shard is not None:
+                    bf16_rem_buckets.add(bucket_id)
+            if bf16_rem_buckets:
+                self._local_step_with_param_remainders(sorted(bf16_rem_buckets))
+            bucket_ids = [
+                bucket_id
+                for bucket_id in bucket_ids
+                if bucket_id not in bf16_rem_buckets
+            ]
+            if not bucket_ids:
+                return
 
         # Find param fragments for each bucket
         buffers = collections.defaultdict(list)  # p_in, m, v, g, p_out
         for bucket_id in bucket_ids:
+            state_bucket = self.state["buckets"][bucket_id]
+            grads_bucket = self._grads_buckets[bucket_id]
+            params_bucket = self._params_buckets[bucket_id]
+
             # Optimizer state buffers for local shard
-            fragments = self.state["buckets"][bucket_id].fragments
-            exp_avg = self.state["buckets"][bucket_id].exp_avg_shard
-            exp_avg_sq = self.state["buckets"][bucket_id].exp_avg_sq_shard
-            grads = self._grads_buckets[bucket_id].grads_shard
-            params_out = self._params_buckets[bucket_id].params_shard
+            fragments = state_bucket.fragments
+            exp_avg = state_bucket.exp_avg_shard
+            exp_avg_sq = state_bucket.exp_avg_sq_shard
+            grads = grads_bucket.grads_shard
+            params_out = params_bucket.params_shard
 
             # Find param fragments in local shard
             for fragment in fragments:
-                if fragment.in_local_shard:
-                    param_group_id = fragment.param_group_id
-                    shard_start, shard_end = fragment.shard_range
-                    if self.store_params:
-                        params_shard = self.state["buckets"][bucket_id].params_shard
-                        param_fragment = params_shard[shard_start:shard_end]
-                    else:
-                        param_id = fragment.param_id
-                        param = self.param_groups[param_group_id]["params"][param_id]
-                        param_start, param_end = fragment.shard_param_range
-                        param_fragment = param.detach().view(-1)[param_start:param_end]
-                        param_fragment = param_fragment.to(
-                            dtype=self.dtype, device=self.device
-                        )
-                    if shard_end > shard_start:
-                        buffers[param_group_id].append(
-                            [
-                                param_fragment,
-                                exp_avg[shard_start:shard_end],
-                                exp_avg_sq[shard_start:shard_end],
-                                grads[shard_start:shard_end],
-                                params_out[shard_start:shard_end],
-                            ]
-                        )
+                if not fragment.in_local_shard:
+                    continue
+                shard_start, shard_end = fragment.shard_range
+                if shard_end <= shard_start:
+                    continue
+                shard_range = slice(shard_start, shard_end)
+                if state_bucket.params_shard is None:
+                    param = self.parameter(fragment)
+                    param_range = slice(*fragment.shard_param_range)
+                    param_fragment = param.detach().view(-1)[param_range]
+                    param_fragment = param_fragment.to(
+                        dtype=state_bucket.dtype, device=self.device
+                    )
+                else:
+                    params_shard = state_bucket.params_shard
+                    param_fragment = params_shard[shard_range]
+                buffers_key = (
+                    fragment.param_group_id,
+                    state_bucket.dtype,
+                    state_bucket.grad_sync_dtype,
+                    state_bucket.param_sync_dtype,
+                )
+                buffers[buffers_key].append(
+                    [
+                        param_fragment,
+                        exp_avg[shard_range],
+                        exp_avg_sq[shard_range],
+                        grads[shard_range],
+                        params_out[shard_range],
+                    ]
+                )
 
         # Apply optimizer step to each param group
-        for group_id, group_buffers in buffers.items():
+        for (group_id, _, _, _), group_buffers in buffers.items():
             group = self.param_groups[group_id]
             beta1, beta2 = group["betas"]
             multi_tensor_applier(
@@ -2122,42 +2403,49 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Find param fragments for each bucket
         buffers = collections.defaultdict(list)  # p_in, p_rem, m, v, g, p_out
         for bucket_id in bucket_ids:
+            state_bucket = self.state["buckets"][bucket_id]
+            grads_bucket = self._grads_buckets[bucket_id]
+            params_bucket = self._params_buckets[bucket_id]
+
             # State buffers for local shard
-            fragments = self.state["buckets"][bucket_id].fragments
-            param_remainders_shard = self.state["buckets"][
-                bucket_id
-            ].param_remainders_shard
-            exp_avg = self.state["buckets"][bucket_id].exp_avg_shard
-            exp_avg_sq = self.state["buckets"][bucket_id].exp_avg_sq_shard
-            grads = self._grads_buckets[bucket_id].grads_shard
-            params_out = self._params_buckets[bucket_id].params_shard
+            fragments = state_bucket.fragments
+            param_remainders_shard = state_bucket.param_remainders_shard
+            exp_avg = state_bucket.exp_avg_shard
+            exp_avg_sq = state_bucket.exp_avg_sq_shard
+            grads = grads_bucket.grads_shard
+            params_out = params_bucket.params_shard
 
             # Find param fragments in local shard
             for fragment in fragments:
-                if fragment.in_local_shard:
-                    param_group_id = fragment.param_group_id
-                    param_id = fragment.param_id
-                    param_start, param_end = fragment.shard_param_range
-                    shard_start, shard_end = fragment.shard_range
-                    param = self.param_groups[param_group_id]["params"][param_id]
-                    param_fragment = param.detach().view(-1)[param_start:param_end]
-                    param_fragment = param_fragment.to(
-                        dtype=torch.bfloat16, device=self.device
-                    )
-                    if shard_end > shard_start:
-                        buffers[param_group_id].append(
-                            [
-                                param_fragment,
-                                param_remainders_shard[shard_start:shard_end],
-                                exp_avg[shard_start:shard_end],
-                                exp_avg_sq[shard_start:shard_end],
-                                grads[shard_start:shard_end],
-                                params_out[shard_start:shard_end],
-                            ]
-                        )
+                if not fragment.in_local_shard:
+                    continue
+                shard_start, shard_end = fragment.shard_range
+                if shard_end <= shard_start:
+                    continue
+                shard_range = slice(shard_start, shard_end)
+                buffers_key = (
+                    fragment.param_group_id,
+                    state_bucket.grad_sync_dtype,
+                )
+                param = self.parameter(fragment)
+                param_range = slice(*fragment.shard_param_range)
+                param_fragment = param.detach().view(-1)[param_range]
+                param_fragment = param_fragment.to(
+                    dtype=torch.bfloat16, device=self.device
+                )
+                buffers[buffers_key].append(
+                    [
+                        param_fragment,
+                        param_remainders_shard[shard_range],
+                        exp_avg[shard_range],
+                        exp_avg_sq[shard_range],
+                        grads[shard_range],
+                        params_out[shard_range],
+                    ]
+                )
 
         # Apply optimizer step to each param group
-        for group_id, group_buffers in buffers.items():
+        for (group_id, _), group_buffers in buffers.items():
             group = self.param_groups[group_id]
             beta1, beta2 = group["betas"]
             multi_tensor_applier(
@@ -2175,34 +2463,111 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 group["weight_decay"],
             )
 
+    @torch.no_grad()
+    def _check_params_shard_dtypes(
+        self,
+        params_buckets: Dict[int, ParameterBucket],
+    ) -> None:
+        """Make sure local shards of parameters are in expected datatypes
+
+        The Adam kernel only supports floating-point datatypes. If we
+        want to perform parameter synchronization with
+        non-floating-point dtypes, we need to allocate temporary
+        buffers that can accommodate the Adam kernel. This function is
+        responsible for converting these temporary buffers to the
+        parameter synchronization datatype.
+
+        """
+
+        # Find param shards that require dtype conversion
+        buffers_in = []
+        buffers_out = []
+        for bucket_id, param_bucket in params_buckets.items():
+
+            # Check if param shard is already in expected dtype
+            state_bucket = self.state["buckets"][bucket_id]
+            param_sync_dtype = state_bucket.param_sync_dtype
+            if param_bucket.params_shard.dtype == param_sync_dtype:
+                continue
+
+            # Allocate buffer with required dtype
+            buffer_in = param_bucket.params_shard
+            buffer_out = torch.empty_like(
+                param_bucket.params_shard,
+                dtype=param_sync_dtype,
+            )
+            param_bucket.params_shard = buffer_out
+
+            if (
+                torch.is_floating_point(buffer_in)
+                and torch.is_floating_point(buffer_out)
+            ):
+                # Cast between floating-point dtypes
+                buffers_in.append(buffer_in)
+                buffers_out.append(buffer_out)
+            else:
+                # Copy most significant bytes for non-floating-point
+                # dtypes
+                # Note: Assume dtypes are little-endian
+                in_bytes = buffer_in.unsqueeze(-1).view(torch.uint8)
+                out_bytes = buffer_out.unsqueeze(-1).view(torch.uint8)
+                copy_size = min(in_bytes.size(-1), out_bytes.size(-1))
+                buffers_in.append(in_bytes[..., -copy_size:])
+                buffers_out.append(out_bytes[..., -copy_size:])
+                if copy_size < out_bytes.size(-1):
+                    out_bytes[..., :-copy_size].zero_()
+
+        # Perform dtype conversions
+        _multi_tensor_copy(
+            buffers_in,
+            buffers_out,
+            dummy_overflow_buf=self._dummy_overflow_buf,
+        )
+
     def state_dict(
         self,
         *,
-        v1_format: bool = False,
+        state_dict_format: Optional[int] = None,
         gather_on_root: Optional[bool] = None,
     ) -> Optional[dict]:
         """Get dictionary containing optimizer state
 
-        Gathers optimizer state on the process group's root rank and
-        returns empty dictionaries on non-root ranks.
+        All ranks in the process group must call this function since
+        it performs communication. The same optimizer state is
+        returned on all ranks.
 
         Arguments:
-            v1_format (bool, optional): Use deprecated v1 format
-                (default: False).
+            state_dict_format (int, optional): Tag for custom or
+                deprecated state dict format.
             gather_on_root (bool, optional): Option for deprecated v1
                 format.
 
         """
 
-        # Deprecated v1 format
-        if v1_format:
+        # Default state dict format
+        if state_dict_format is None:
+            state_dict_format = 2
+
+        # Construct state dict
+        state_dict = None
+        if state_dict_format == 1:
+            # Deprecated v1 format
             kwargs = {}
             if gather_on_root is not None:
                 kwargs["gather_on_root"] = gather_on_root
-            return self._state_dict_v1(**kwargs)
+            state_dict = self._state_dict_v1(**kwargs)
+        elif state_dict_format == 2:
+            # Default v2 format
+            state_dict = self._state_dict_v2()
+        else:
+            # Unrecognized format
+            raise ValueError(f"Unrecognized state dict format ({state_dict_format})")
 
-        # Default v2 format
-        return self._state_dict_v2()
+        # Add format tag to state dict
+        if state_dict is not None:
+            state_dict["format"] = state_dict_format
+
+        return state_dict
 
     def _state_dict_v1(self, gather_on_root: bool = True) -> Optional[dict]:
         """Get dictionary containing optimizer state (deprecated v1 format)
@@ -2281,7 +2646,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Note: Assuming we are using the NCCL backend, communication
         # must happen on the GPU. We split the data into fixed-size
         # chunks to limit GPU memory usage.
-        # TODO: Avoid chunking with direct communication between CPUs
         main_stream = torch.cuda.current_stream()
         for stream in self._pipeline_streams:
             stream.wait_stream(main_stream)
@@ -2364,11 +2728,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             return None
 
     @torch.no_grad()
-    def _state_dict_v2(self) -> dict:
+    def _state_dict_v2(self) -> Optional[dict]:
         """Get dictionary containing optimizer state (default v2 format)
 
-        Gathers optimizer state on the process group's root rank and
-        returns empty dictionaries on non-root ranks.
+        All ranks in the process group must call this function since
+        it performs communication. The same optimizer state is
+        returned on all ranks.
 
         """
 
@@ -2379,63 +2744,40 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self.grad_sync()
         self.param_sync()
 
-        # Return immediately on ranks with redundant data
-        if self.redundant_size > 1:
-            if torch.distributed.get_rank(self.redundant_process_group) > 0:
-                return {}
+        # Get state dict from base class
+        state_dict = super().state_dict()
+        state_dict["state"] = {"step": state_dict["state"]["step"]}
 
-        # Initialize state dict on root rank
-        if self.distributed_rank == 0:
-            # Get state dict from base class
-            state_dict = super().state_dict()
-            state_dict["state"] = {"step": state_dict["state"]["step"]}
+        # Initialize state dict with CPU buffers
+        for param in self.parameters():
+            # Get param index in state dict
+            fragment = self.state[param]["fragments"][0]
+            param_group_id = fragment.param_group_id
+            param_id = fragment.param_id
+            index = state_dict["param_groups"][param_group_id]["params"][param_id]
 
-            # Initialize state dict with CPU buffers
-            for param in self.parameters():
-                # Get param index in state dict
-                fragment = self.state[param]["fragments"][0]
-                param_group_id = fragment.param_group_id
-                param_id = fragment.param_id
-                index = state_dict["param_groups"][param_group_id]["params"][param_id]
-
-                # Construct CPU buffers with optimizer state
-                state_dict["state"][index] = dict(
-                    param=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
-                    exp_avg=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
-                    exp_avg_sq=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
-                )
+            # Construct CPU buffers with optimizer state
+            state_dict["state"][index] = dict(
+                param=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
+                exp_avg=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
+                exp_avg_sq=torch.zeros_like(param, dtype=self.dtype, device="cpu"),
+            )
 
         # Workspace buffers for gathering shards on root rank
         num_buckets = len(self.state["buckets"])
-        if self.distributed_rank == 0:
-            max_bucket_size = max(
-                bucket.bucket_size for bucket in self.state["buckets"]
+        max_bucket_size = max(bucket.bucket_size for bucket in self.state["buckets"])
+        bucket_buffers = [
+            torch.empty(
+                [max_bucket_size],
+                dtype=self.dtype,
+                device=self.device,
             )
-            bucket_buffers = [
-                torch.empty(
-                    [max_bucket_size],
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                for _ in range(self.pipeline_size)
-            ]
-
-        # Workspace buffers for packing param state
-        max_shard_size = max(bucket.shard_size for bucket in self.state["buckets"])
-        if self.store_params:
-            pass
-        elif self.store_param_remainders:
+            for _ in range(self.pipeline_size)
+        ]
+        if self.store_param_remainders:
+            max_shard_size = max(bucket.shard_size for bucket in self.state["buckets"])
             shard_bf16_buffers = [
                 torch.empty([max_shard_size], dtype=torch.bfloat16, device=self.device)
-                for _ in range(self.pipeline_size)
-            ]
-            shard_fp32_buffers = [
-                torch.empty([max_shard_size], dtype=torch.float32, device=self.device)
-                for _ in range(self.pipeline_size)
-            ]
-        else:
-            shard_buffers = [
-                torch.empty([max_shard_size], dtype=self.dtype, device=self.device)
                 for _ in range(self.pipeline_size)
             ]
 
@@ -2456,11 +2798,11 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             shard_size = bucket.shard_size
 
             # Case 1: Param state is already packed
-            if self.store_params:
+            if bucket.params_shard is not None:
                 return bucket.params_shard
 
             # Case 2: Pack BF16 model params with 16-bit remainders
-            if self.store_param_remainders:
+            if bucket.param_remainders_shard is not None:
                 with torch.cuda.stream(stream):
                     # Pack bf16 param values
                     shard_bf16 = shard_bf16_buffers[stream_id][:shard_size]
@@ -2469,11 +2811,9 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     for fragment in bucket.fragments:
                         if not fragment.in_local_shard:
                             continue
-                        param_id = fragment.param_id
-                        param_group_id = fragment.param_group_id
                         param_range = slice(*fragment.shard_param_range)
                         shard_range = slice(*fragment.shard_range)
-                        param = self.param_groups[param_group_id]["params"][param_id]
+                        param = self.parameter(fragment)
                         buffers_in.append(param.view(-1)[param_range])
                         buffers_out.append(shard_bf16[shard_range])
                     _multi_tensor_copy(
@@ -2483,27 +2823,33 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     )
 
                     # Reconstruct fp32 from bf16 and remainders
-                    shard = shard_fp32_buffers[stream_id][:shard_size]
+                    shard_range = slice(
+                        shard_size * self.distributed_rank,
+                        shard_size * (self.distributed_rank + 1),
+                    )
+                    shard_fp32 = bucket_buffers[stream_id][shard_range]
                     _bf16_rem_to_fp32(
                         shard_bf16,
                         bucket.param_remainders_shard,
-                        shard,
+                        shard_fp32,
                     )
-                    return shard
+                    return shard_fp32
 
             # Case 3: Pack model params
             with torch.cuda.stream(stream):
-                shard = shard_buffers[stream_id][:shard_size]
+                shard_range = slice(
+                    shard_size * self.distributed_rank,
+                    shard_size * (self.distributed_rank + 1),
+                )
+                shard = bucket_buffers[stream_id][shard_range]
                 buffers_in = []
                 buffers_out = []
                 for fragment in bucket.fragments:
                     if not fragment.in_local_shard:
                         continue
-                    param_id = fragment.param_id
-                    param_group_id = fragment.param_group_id
                     param_range = slice(*fragment.shard_param_range)
                     shard_range = slice(*fragment.shard_range)
-                    param = self.param_groups[param_group_id]["params"][param_id]
+                    param = self.parameter(fragment)
                     buffers_in.append(param.view(-1)[param_range])
                     buffers_out.append(shard[shard_range])
                 _multi_tensor_copy(
@@ -2513,11 +2859,11 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 )
                 return shard
 
-        def start_gather(bucket_id: int, shard: torch.Tensor) -> None:
-            """Launch gather on bucket shards
+        def start_all_gather(bucket_id: int, shard: torch.Tensor) -> None:
+            """Launch all-gather on bucket shards
 
             Communication is done on main stream to ensure consistent
-            ordering. Bucket shards are gathered into root rank.
+            ordering.
 
             """
 
@@ -2525,47 +2871,33 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             stream_id = bucket_id % self.pipeline_size
             stream = self._pipeline_streams[stream_id]
 
-            # Initialize gather buffer on root rank
-            bucket_shards = None
-            if self.distributed_rank == 0:
-                # Workspace buffer
-                bucket = self.state["buckets"][bucket_id]
-                bucket_size = bucket.bucket_size
-                bucket_buffer = bucket_buffers[stream_id][:bucket_size]
+            # Workspace buffer
+            bucket = self.state["buckets"][bucket_id]
+            bucket_size = bucket.bucket_size
+            bucket_buffer = bucket_buffers[stream_id][:bucket_size]
 
-                # Shards in workspace buffer
-                shard_size = bucket.shard_size
-                bucket_shards = [
-                    bucket_buffer[i * shard_size : (i + 1) * shard_size]
-                    for i in range(self.distributed_size)
-                ]
-
-            # Gather shards into root rank
+            # All-gather shards
             main_stream.wait_stream(stream)
-            torch.distributed.gather(
+            all_gather_into_tensor(
+                bucket_buffer,
                 shard,
-                bucket_shards,
-                dst=self.process_group_root,
                 group=self.distributed_process_group,
             )
             stream.wait_stream(main_stream)
 
-        def finish_gather(bucket_id: int, state_dict_key: str) -> None:
-            """Finish gather on bucket shards
+        def finish_all_gather(bucket_id: int, state_dict_key: str) -> None:
+            """Finish all-gather on bucket shards
 
-            Data is copied into state dict CPU buffers on the root
-            rank.
+            Data is copied into state dict CPU buffers.
 
-            Splitting the NCCL gather and the CPU memcpys into
+            Splitting the NCCL all-gather and the CPU memcpys into
             separate stages helps achieve good overlap when kernel
             launches are serialized with
             CUDA_DEVICE_MAX_CONNECTIONS=1. In particular, the pipeline
-            calls start_gather(bucket_id+1) before
-            finish_gather(bucket_id).
+            calls start_all_gather(bucket_id+1) before
+            finish_all_gather(bucket_id).
 
             """
-            if self.distributed_rank != 0:
-                return
 
             # Stream objects
             stream_id = bucket_id % self.pipeline_size
@@ -2591,54 +2923,60 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     bucket_fragment = bucket_buffer[bucket_range]
                     state_fragment.copy_(bucket_fragment, non_blocking=True)
 
-        # Gather param state
+        # All-gather param state
         for bucket_id in range(num_buckets):
             shard = pack_param_shard(bucket_id)
-            start_gather(bucket_id, shard)
+            start_all_gather(bucket_id, shard)
             if bucket_id > 0:
-                finish_gather(bucket_id - 1, "param")
+                finish_all_gather(bucket_id - 1, "param")
             if bucket_id == num_buckets - 1:
-                finish_gather(bucket_id, "param")
+                finish_all_gather(bucket_id, "param")
 
-        # Gather exp_avg state
+        # All-gather exp_avg state
         for bucket_id in range(num_buckets):
             shard = self.state["buckets"][bucket_id].exp_avg_shard
-            start_gather(bucket_id, shard)
+            start_all_gather(bucket_id, shard)
             if bucket_id > 0:
-                finish_gather(bucket_id - 1, "exp_avg")
+                finish_all_gather(bucket_id - 1, "exp_avg")
             if bucket_id == num_buckets - 1:
-                finish_gather(bucket_id, "exp_avg")
+                finish_all_gather(bucket_id, "exp_avg")
 
-        # Gather exp_avg_sq state
+        # All-gather exp_avg_sq state
         for bucket_id in range(num_buckets):
             shard = self.state["buckets"][bucket_id].exp_avg_sq_shard
-            start_gather(bucket_id, shard)
+            start_all_gather(bucket_id, shard)
             if bucket_id > 0:
-                finish_gather(bucket_id - 1, "exp_avg_sq")
+                finish_all_gather(bucket_id - 1, "exp_avg_sq")
             if bucket_id == num_buckets - 1:
-                finish_gather(bucket_id, "exp_avg_sq")
+                finish_all_gather(bucket_id, "exp_avg_sq")
 
-        # Synchronize GPU
+        # Synchronize GPU and return
         for stream in self._pipeline_streams:
             main_stream.wait_stream(stream)
         main_stream.synchronize()
-
-        # Return state dict on root rank
-        if self.distributed_rank == 0:
-            return state_dict
-        else:
-            return {}
+        return state_dict
 
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state"""
 
-        # Deprecated v1 format
-        if "buckets" in state_dict["state"] or "gathered_states" in state_dict["state"]:
-            self._load_state_dict_v1(state_dict)
-            return
+        # Figure out state dict format
+        state_dict_format = state_dict.pop("format", None)
+        if state_dict_format is None:
+            if "buckets" in state_dict or "gathered_states" in state_dict:
+                state_dict_format = 1
+            else:
+                state_dict_format = 2
 
-        # Default v2 format
-        self._load_state_dict_v2(state_dict)
+        # Load state dict
+        if state_dict_format == 1:
+            # Deprecated v1 format
+            self._load_state_dict_v1(state_dict)
+        elif state_dict_format == 2:
+            # Default v2 format
+            self._load_state_dict_v2(state_dict)
+        else:
+            # Unrecognized format
+            raise ValueError(f"Unrecognized state dict format ({state_dict_format})")
 
     def _load_state_dict_v1(self, state_dict: dict) -> None:
         """Load optimizer state (deprecated v1 format)
@@ -2653,7 +2991,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             "Future support is not guaranteed."
         )
 
-        # State dict contains state for all ranks
+        # Get state dict for current rank
         if "gathered_states" in state_dict:
             # Deallocate distributed optimizer state to reduce GPU
             # memory usage
@@ -2665,7 +3003,17 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             state_bytes = io.BytesIO(state_bytes.numpy())
             state_dict = torch.load(state_bytes)
 
+        # Load state dict
         super().load_state_dict(state_dict)
+
+        # Handle old state dicts without per-bucket dtypes
+        for bucket in self.state["buckets"]:
+            if getattr(bucket, "dtype", None) is None:
+                bucket.dtype = self.dtype
+            if getattr(bucket, "grad_sync_dtype", None) is None:
+                bucket.grad_sync_dtype = self.grad_sync_dtype
+            if getattr(bucket, "param_sync_dtype", None) is None:
+                bucket.param_sync_dtype = self.param_sync_dtype
 
     @torch.no_grad()
     def _load_state_dict_v2(self, state_dict: dict) -> None:
